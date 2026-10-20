@@ -1,17 +1,17 @@
-# CO₂ per capita: pipeline medalionu w Databricks
+# CO₂ per capita: a medallion pipeline on Databricks
 
-Projekt zaliczeniowy: pipeline danych w architekturze medalionu (bronze → silver → gold) w Databricks, napisany w Python/PySpark, z tabelami Delta w Unity Catalog. Pipeline łączy dwa źródła danych i liczy emisję CO₂ na mieszkańca dla krajów i regionów świata.
+A university project: a data pipeline in the medallion architecture (bronze → silver → gold) built on Databricks with Python/PySpark and Delta tables in Unity Catalog. It combines two data sources and computes CO₂ emissions per capita for countries and regions of the world.
 
-## Źródła danych
+## Data sources
 
-| Źródło | Format | Co zawiera |
+| Source | Format | Contents |
 |---|---|---|
-| [World Bank API](https://api.worldbank.org/v2/country?format=json&per_page=400) | JSON (zagnieżdżony) | lista krajów i agregatów: kod ISO3 (`id`), region (`region.value`) |
-| [Our World in Data: CO₂](https://github.com/owid/co2-data) | CSV | wiersz = kraj + rok: `co2` (mln ton), `population` (liczba osób), `iso_code` |
+| [World Bank API](https://api.worldbank.org/v2/country?format=json&per_page=400) | JSON (nested) | countries and aggregates: ISO3 code (`id`), region (`region.value`) |
+| [Our World in Data: CO₂](https://github.com/owid/co2-data) | CSV | one row per country and year: `co2` (million tonnes), `population` (people), `iso_code` |
 
-Klucz łączenia: kod ISO3 kraju (`World Bank id` = `iso_code`).
+Join key: the country's ISO3 code (`World Bank id` = `iso_code`).
 
-## Architektura
+## Architecture
 
 ```
 World Bank API (JSON) ─► bronze.countries ──┐
@@ -19,42 +19,42 @@ World Bank API (JSON) ─► bronze.countries ──┐
 OWID CSV ─────────────► bronze.pollution ───┘                                  └─► gold.co2_tonnes_per_capita_by_region
 ```
 
-Wszystkie tabele leżą w katalogu `pollution_per_country_pipeline_project`, w schematach `bronze`, `silver`, `gold`.
+All tables live in the `pollution_per_country_pipeline_project` catalog, in the `bronze`, `silver` and `gold` schemas.
 
-### Bronze: surowe dane
+### Bronze: raw data
 
-Dane trafiają do tabel Delta bez zmian. Zapis `createOrReplace()` jest idempotentny: ponowne uruchomienie nie dubluje wierszy.
+Data lands in Delta tables unchanged. Writes use `createOrReplace()`, so they are idempotent: re-running a notebook does not duplicate rows.
 
-| Notebook | Tabela | Opis |
+| Notebook | Table | Description |
 |---|---|---|
-| `01_bronze_countries` | `bronze.countries` | odpowiedź API (2. element listy, 1. to metadane), 296 wierszy |
-| `02_bronze_pollution` | `bronze.pollution` | cały plik CSV z OWID |
+| `01_bronze_countries` | `bronze.countries` | API response (2nd element of the list; the 1st is metadata), 296 rows |
+| `02_bronze_pollution` | `bronze.pollution` | the full OWID CSV |
 
-### Silver: dane oczyszczone i połączone
+### Silver: cleaned and joined data
 
-Notebook `03_silver`, tabela `silver.countries_x_pollution` (22 386 wierszy, jeden na kraj i rok).
+Notebook `03_silver`, table `silver.countries_x_pollution` (22,386 rows, one per country and year).
 
-- **countries:** deduplikacja po `id`, usunięcie agregatów (`region.value = 'Aggregates'`, np. "Africa"), spłaszczenie zagnieżdżonego regionu do kolumny `region`.
-- **pollution:** usunięcie wierszy z brakiem `iso_code`, `year`, `co2` lub `population` (to m.in. wiersze zbiorcze typu "World"), odrzucenie `co2 = 0`, deduplikacja po (`iso_code`, `year`).
-- **join:** `left join` po `iso_code`, żeby nie tracić prawdziwych terytoriów, których nie ma na liście World Banku (np. TWN, WLF, NIU).
-- **brak regionu:** puste wartości zastąpione napisem `Unclassified Region - {kraj}`.
+- **countries:** de-duplicate on `id`, drop aggregate rows (`region.value = 'Aggregates'`, e.g. "Africa"), flatten the nested region into a `region` column.
+- **pollution:** drop rows with a missing `iso_code`, `year`, `co2` or `population` (this removes non-country rows such as "World"), drop `co2 = 0`, de-duplicate on (`iso_code`, `year`).
+- **join:** `left join` on `iso_code`, so real territories missing from the World Bank list (e.g. TWN, WLF, NIU) are not lost.
+- **missing region:** null values are replaced with `Unclassified Region - {country}`.
 
-Filtr `co2 = 0` jest potrzebny ze względu na gold: populacja takich wierszy zawyżałaby mianownik wskaźnika regionalnego.
+The `co2 = 0` filter matters for gold: the population of such rows would inflate the denominator of the regional indicator.
 
-### Gold: tabele analityczne
+### Gold: analytical tables
 
-Notebook `04_gold`. Wskaźnik w obu tabelach to `avg_co2_per_capita` w **tonach CO₂ na osobę**. Surowe `co2` jest w milionach ton, stąd przeliczenie `* 1 000 000`.
+Notebook `04_gold`. In both tables the indicator is `avg_co2_per_capita`, in **tonnes of CO₂ per person**. The raw `co2` is in million tonnes, hence the `* 1,000,000` conversion.
 
-| Tabela | Ziarno | Obliczenie |
+| Table | Grain | Calculation |
 |---|---|---|
-| `gold.co2_tonnes_per_capita_by_country` | kraj + rok | `co2 / population * 1e6` |
-| `gold.co2_tonnes_per_capita_by_region` | region + rok | `sum(co2) / sum(population) * 1e6` |
+| `gold.co2_tonnes_per_capita_by_country` | country + year | `co2 / population * 1e6` |
+| `gold.co2_tonnes_per_capita_by_region` | region + year | `sum(co2) / sum(population) * 1e6` |
 
-Dla regionów wskaźnik liczony jest jako iloraz sum, a **nie** średnia ilorazów krajów. Średnia z ilorazów traktowałaby mały kraj tak samo jak duży i fałszowałaby wynik.
+The regional indicator is a ratio of sums, **not** an average of country ratios. Averaging ratios would weigh a small country the same as a large one and distort the result.
 
-Grupy `Unclassified Region - {kraj}` zostają w tabeli regionalnej jako grupy jednoelementowe. Odbiorca danych może je odfiltrować.
+`Unclassified Region - {country}` groups stay in the regional table as single-country groups. Consumers can filter them out.
 
-## Struktura repozytorium
+## Repository layout
 
 ```
 notebooks/
@@ -64,20 +64,20 @@ notebooks/
   04_gold.ipynb
 ```
 
-## Uruchomienie
+## Running it
 
-1. Utwórz w Databricks katalog `pollution_per_country_pipeline_project` ze schematami `bronze`, `silver`, `gold` (projekt powstał w Databricks Free Edition, compute: serverless).
-2. Zaimportuj notebooki z `notebooks/` do workspace'u.
-3. Uruchom je po kolei: `01` → `02` → `03` → `04`.
+1. In Databricks, create the catalog `pollution_per_country_pipeline_project` with the schemas `bronze`, `silver` and `gold` (the project was built on Databricks Free Edition with serverless compute).
+2. Import the notebooks from `notebooks/` into your workspace.
+3. Run them in order: `01` → `02` → `03` → `04`.
 
-Źródła są pobierane po HTTP, więc nie trzeba wgrywać żadnych plików ani konfigurować kluczy API.
+The sources are fetched over HTTP, so there are no files to upload and no API keys to configure.
 
-## Stos
+## Stack
 
 Python, PySpark, Delta Lake, Databricks (Unity Catalog), `requests`, `pandas`.
 
-## Możliwe usprawnienia
+## Possible improvements
 
-- Bronze CSV czytany przez `pandas` (typy zgadywane, brak surowej kopii pliku). Alternatywa: zapis pliku do Volume i `spark.read.csv`.
-- Kolumna `is_unclassified` w silver zamiast filtrowania po napisie `Unclassified Region`.
-- Orkiestracja notebooków przez Databricks Job.
+- The bronze CSV is read with `pandas` (types are guessed, and there is no raw copy of the file). Alternative: store the file in a Volume and read it with `spark.read.csv`.
+- An `is_unclassified` column in silver instead of filtering on the `Unclassified Region` string.
+- Orchestrate the notebooks with a Databricks Job.
